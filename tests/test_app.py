@@ -2,20 +2,29 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from io import BytesIO
+import zipfile
 
 from openpyxl import Workbook, load_workbook
 
-from app import ImportDatabase, create_preview_workbook, inspect_workbook
+from app import (
+    ImportDatabase,
+    _slicer_values,
+    create_preview_workbook,
+    inspect_workbook,
+)
 
 
-def sample_workbook() -> bytes:
+def sample_workbook(pivot_date: datetime | None = None) -> bytes:
     workbook = Workbook()
     pivot = workbook.active
     pivot.title = "PIVOT"
     pivot["B5"] = "Тестова мережа"
     pivot["F1"] = "за тестовий період"
+    if pivot_date is not None:
+        pivot["B1"] = pivot_date
 
     for sheet_name in ("LA_Price", "Реквізити", "Реквізити_лік"):
         sheet = workbook.create_sheet(sheet_name)
@@ -42,11 +51,24 @@ def sample_workbook() -> bytes:
 
 
 class WorkbookTests(unittest.TestCase):
+    def test_filter_choices_are_read_from_workbook_slicer_cache(self) -> None:
+        content = BytesIO()
+        with zipfile.ZipFile(content, "w") as archive:
+            archive.writestr(
+                "xl/slicerCaches/slicerCache2.xml",
+                """<cache><i n="chain-a" c="Мережа А"/><i n="chain-b" c="Мережа Б"/>"""
+                """<selection n="chain-b"/></cache>""",
+            )
+        values, selected = _slicer_values(content.getvalue(), "slicerCache2")
+        self.assertEqual(values, ["Мережа А", "Мережа Б"])
+        self.assertEqual(selected, "Мережа Б")
+
     def test_inspection_finds_current_network_and_period(self) -> None:
         info = inspect_workbook(sample_workbook())
         self.assertEqual(info.network, "Тестова мережа")
         self.assertEqual(info.period, "за тестовий період")
         self.assertEqual(info.networks, ["Тестова мережа"])
+        self.assertEqual(info.selected_period, "за тестовий період")
 
     def test_both_variants_create_two_sheet_workbooks(self) -> None:
         content = sample_workbook()
@@ -64,6 +86,15 @@ class WorkbookTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Дані PIVOT підготовлені"):
             create_preview_workbook(
                 sample_workbook(), "ДД", "Інша мережа", "будь-який період"
+            )
+
+    def test_refuses_period_not_selected_in_pivot(self) -> None:
+        with self.assertRaisesRegex(ValueError, "дані лише за період"):
+            create_preview_workbook(
+                sample_workbook(datetime(2026, 8, 31)),
+                "ДД",
+                "Тестова мережа",
+                "15.03.2026 (Березень 2026)",
             )
 
     def test_database_deduplicates_imports_and_persists_workbook(self) -> None:

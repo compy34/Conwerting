@@ -4,6 +4,7 @@ import hashlib
 import os
 import sqlite3
 import tkinter as tk
+import xml.etree.ElementTree as ET
 import warnings
 import zipfile
 from dataclasses import dataclass
@@ -139,6 +140,8 @@ class WorkbookInfo:
     networks: list[str]
     network: str
     period: str
+    periods: list[str]
+    selected_period: str
     sheet_names: set[str]
 
 
@@ -165,6 +168,78 @@ def _display_period(value: object, fallback: object = None) -> str:
     return "Період не визначено"
 
 
+UKRAINIAN_MONTHS = (
+    "Січень",
+    "Лютий",
+    "Березень",
+    "Квітень",
+    "Травень",
+    "Червень",
+    "Липень",
+    "Серпень",
+    "Вересень",
+    "Жовтень",
+    "Листопад",
+    "Грудень",
+)
+
+
+def _month_label(value: object) -> str | None:
+    parsed: datetime | None = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime(value.year, value.month, value.day)
+    elif isinstance(value, (int, float)):
+        try:
+            from openpyxl.utils.datetime import from_excel
+
+            parsed = from_excel(value)
+        except (OverflowError, ValueError):
+            return None
+    if parsed is None:
+        return None
+    return f"{UKRAINIAN_MONTHS[parsed.month - 1]} {parsed.year}"
+
+
+def _slicer_values(content: bytes, cache_name: str) -> tuple[list[str], str | None]:
+    cache_path = f"xl/slicerCaches/{cache_name}.xml"
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            root = ET.fromstring(archive.read(cache_path))
+    except (KeyError, OSError, ET.ParseError, zipfile.BadZipFile):
+        return [], None
+
+    values: list[str] = []
+    item_by_name: dict[str, str] = {}
+    selected_names: set[str] = set()
+    for element in root.iter():
+        local_name = element.tag.rsplit("}", 1)[-1]
+        if local_name == "i":
+            name = element.attrib.get("n")
+            caption = element.attrib.get("c")
+            if name and caption and caption != "(blank)":
+                item_by_name[name] = caption
+                if caption not in values:
+                    values.append(caption)
+        elif local_name == "selection":
+            selected = element.attrib.get("n")
+            if selected:
+                selected_names.add(selected)
+    selected_values = [
+        item_by_name[name] for name in selected_names if name in item_by_name
+    ]
+    return values, selected_values[0] if len(selected_values) == 1 else None
+
+
+def _period_option(date_caption: str) -> str:
+    try:
+        parsed = datetime.strptime(date_caption, "%d.%m.%Y")
+    except ValueError:
+        return date_caption
+    return f"{date_caption} ({_month_label(parsed)})"
+
+
 def inspect_workbook(content: bytes) -> WorkbookInfo:
     try:
         workbook = _load_workbook_values(content)
@@ -187,6 +262,27 @@ def inspect_workbook(content: bytes) -> WorkbookInfo:
         period = _display_period(
             _read_cell_value(pivot["F1"]), _read_cell_value(pivot["E1"])
         )
+        active_month = _month_label(_read_cell_value(pivot["B1"]))
+        available_networks, _ = _slicer_values(content, "slicerCache2")
+        available_period_dates, slicer_period = _slicer_values(
+            content, "slicerCache1"
+        )
+        networks = available_networks or [selected_network]
+        if selected_network not in networks:
+            networks.append(selected_network)
+        periods = [_period_option(value) for value in available_period_dates]
+        selected_period = (
+            _period_option(slicer_period)
+            if slicer_period
+            else next(
+                (
+                    option
+                    for option in periods
+                    if active_month and active_month in option
+                ),
+                active_month or period,
+            )
+        )
 
         has_selected_network = False
         for sheet_name in ("Реквізити", "Реквізити_лік"):
@@ -201,9 +297,11 @@ def inspect_workbook(content: bytes) -> WorkbookInfo:
             )
 
         return WorkbookInfo(
-            networks=[selected_network],
+            networks=networks,
             network=selected_network,
             period=period,
+            periods=periods or [active_month or period],
+            selected_period=selected_period,
             sheet_names=names,
         )
     finally:
@@ -292,6 +390,14 @@ def create_preview_workbook(
             "Дані PIVOT підготовлені для мережі "
             f"«{actual_network}», а вибрано «{network}». "
             "Оновіть/відфільтруйте PIVOT у вихідній книзі та імпортуйте її повторно."
+        )
+    actual_period = _month_label(source["PIVOT"]["B1"].value)
+    if actual_period and actual_period not in period:
+        source.close()
+        raise ValueError(
+            f"У завантаженій книзі дані лише за період «{actual_period}», "
+            f"а вибрано «{period}». Виберіть період, що відповідає PIVOT, "
+            "або спершу відфільтруйте/оновіть книгу в Excel і завантажте її повторно."
         )
 
     warnings: list[str] = []
@@ -413,13 +519,26 @@ class ActsReportsApp:
         ttk.Label(options, text="Період:").grid(
             row=1, column=0, sticky="w", pady=(10, 0)
         )
+        self.period_var = tk.StringVar()
+        self.period_combo = ttk.Combobox(
+            options, textvariable=self.period_var, state="readonly", width=42
+        )
+        self.period_combo.grid(
+            row=1, column=1, sticky="w", padx=(8, 18), pady=(10, 0)
+        )
+        self.period_combo.bind("<<ComboboxSelected>>", self._options_changed)
+        ttk.Label(options, text="Активний період у файлі:").grid(
+            row=1, column=2, sticky="w", pady=(10, 0)
+        )
         self.period_label = ttk.Label(options, text="—")
         self.period_label.grid(
-            row=1, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(10, 0)
+            row=1, column=3, sticky="w", padx=(8, 0), pady=(10, 0)
         )
         ttk.Label(
             options,
-            text="За замовчуванням використовується весь період, наявний у PIVOT.",
+            text="Списки взято зі збережених фільтрів Excel. Для формування "
+            "вибір має відповідати активному зрізу PIVOT у завантаженому файлі.",
+            wraplength=800,
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         action_row = ttk.Frame(outer)
@@ -474,6 +593,8 @@ class ActsReportsApp:
         self.file_label.configure(text=path.name)
         self.network_combo.configure(values=info.networks)
         self.network_var.set(info.network)
+        self.period_combo.configure(values=info.periods)
+        self.period_var.set(info.selected_period)
         self.period_label.configure(text=info.period)
         self.preview_button.configure(state="normal")
         self.save_button.configure(state="disabled")
@@ -497,8 +618,16 @@ class ActsReportsApp:
                 "Попередній перегляд буде доступний лише для мережі, "
                 "на яку відфільтрований PIVOT у цій книзі."
             )
+        elif self.info and (
+            self.info.selected_period != self.period_var.get()
+            and self.info.periods
+        ):
+            self.status_var.set(
+                "Попередній перегляд доступний лише для періоду, "
+                "на який відфільтрований PIVOT у цій книзі."
+            )
         elif self.info:
-            self.status_var.set("Мережу вибрано.")
+            self.status_var.set("Мережу та період вибрано.")
 
     def _clear_preview(self) -> None:
         for widget in self.preview_tabs.winfo_children():
@@ -546,7 +675,7 @@ class ActsReportsApp:
                 content,
                 self.variant_var.get(),
                 self.network_var.get(),
-                self.info.period if self.info else "",
+                self.period_var.get(),
             )
             self._clear_preview()
             self._populate_tree(0, workbook["Акт"], "Акт")
@@ -587,7 +716,10 @@ class ActsReportsApp:
                 parent=self.root,
             )
             return
-        default_name = f"Акт_звіт_{self.network_var.get()}_{self.variant_var.get()}.xlsx"
+        default_name = (
+            f"Акт_звіт_{self.network_var.get()}_"
+            f"{self.variant_var.get()}_{self.period_var.get().split(' ')[0]}.xlsx"
+        )
         destination = filedialog.asksaveasfilename(
             title="Зберегти акт і звіт",
             defaultextension=".xlsx",
@@ -602,7 +734,7 @@ class ActsReportsApp:
                 content,
                 self.variant_var.get(),
                 self.network_var.get(),
-                self.info.period,
+                self.period_var.get(),
             )
             workbook.save(destination)
             workbook.close()
