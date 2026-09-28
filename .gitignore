@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+Append_New_Template_ActsReports_ 2026.04(test).xlsx
